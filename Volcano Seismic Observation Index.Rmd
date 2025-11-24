@@ -1,0 +1,770 @@
+---
+title: "Trident Volcano v3"
+author: "Matt Haar"
+date: "2025-11-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+
+Description: Load all required packages for data retrieval, manipulation, and plotting.
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(httr)
+library(jsonlite)
+library(ggplot2)
+library(purrr)
+library(zoo)      
+library(plotly)   
+```
+
+# Download USGS earthquake data for Trident region
+
+Description: Define the Trident bounding box and time window, then query the USGS FDSN API for all earthquakes in that region and time period.
+```{r dowload-data}
+# 1. Define Trident region and time window
+trident_bbox <- list(
+  minlatitude  = 58.0,
+  maxlatitude  = 58.5,
+  minlongitude = -155.4,
+  maxlongitude = -154.8
+)
+
+starttime <- "2010-01-01"
+endtime   <- "2025-11-22"   # update as needed
+
+# 2. Build and send request to USGS
+base_url <- "https://earthquake.usgs.gov/fdsnws/event/1/query"
+
+resp <- GET(
+  url = base_url,
+  query = c(
+    format = "geojson",
+    starttime = starttime,
+    endtime   = endtime,
+    trident_bbox,
+    eventtype = "earthquake",
+    minmagnitude = 0
+  )
+)
+
+stop_for_status(resp)
+
+raw_json <- content(resp, "text", encoding = "UTF-8")
+eq <- fromJSON(raw_json, flatten = TRUE)
+```
+
+# Build event-level earthquake table
+
+Description: Convert the raw GeoJSON features into a tidy event-level table with time, magnitude, location, and depth (in km and miles).
+```{r build-quake-table}
+quakes <- eq$features %>%
+  as_tibble() %>%
+  transmute(
+    time = as.POSIXct(properties.time / 1000,
+                      origin = "1970-01-01", tz = "UTC"),
+    mag   = properties.mag,
+    place = properties.place,
+    lon   = purrr::map_dbl(geometry.coordinates, 1),
+    lat   = purrr::map_dbl(geometry.coordinates, 2),
+    depth_km    = purrr::map_dbl(geometry.coordinates, 3),      # depth from USGS
+    depth_miles = depth_km * 0.621371                          # depth for public-facing labels
+  ) %>%
+  arrange(time)
+
+glimpse(quakes)
+```
+
+# Aggregate to daily seismic metrics
+
+Description: Summarize event-level data into daily metrics that will feed into the unrest index (daily event count, magnitude distribution, and shallow-earthquake percentage).
+Negative depths are set to 0 km, and “shallow” is defined as < 3 km.
+```{r daily-metrics}
+quakes_daily <- quakes %>%
+  mutate(
+    depth_km = ifelse(depth_km < 0, 0, depth_km),   # clamp negative depths to 0 km
+    date     = as.Date(time)
+  ) %>%
+  group_by(date) %>%
+  summarise(
+    n_events    = n(),                                # daily number of earthquakes
+    median_mag  = median(mag, na.rm = TRUE),          # typical quake size that day
+    p90_mag     = quantile(mag, 0.9, na.rm = TRUE),   # larger quake size indicator
+    shallow_pct = mean(depth_km <= 3, na.rm = TRUE),  # % of shallow quakes (< 3 km)
+    .groups = "drop"                                  # return ungrouped dataframe
+  )
+
+head(quakes_daily)
+```
+
+# Baseline configuration (fixed, rolling, anchored)
+
+Description: Configure how the baseline is defined.
+	•	baseline_mode = "fixed" uses a pre-unrest historical window.
+	•	baseline_mode = "rolling" uses a rolling window (previous N years) for each date.
+	•	baseline_mode = "anchored" uses a 3/5/7-year or historical window before a chosen reference date t₀.
+```{r baseline-config}
+# -------------------------------------------------------------------
+# Baseline configuration
+# -------------------------------------------------------------------
+
+# Choose baseline mode: "fixed", "rolling", or "anchored"
+baseline_mode <- "anchored"
+
+# For rolling baseline (not the main focus right now)
+baseline_window_years <- 3   # previous N years per date if baseline_mode == "rolling"
+
+# Fixed (historical) baseline: user-defined quiet period (pre-unrest)
+baseline_fixed_start <- as.Date("2015-01-01")
+baseline_fixed_end   <- as.Date("2022-08-24")  # start of documented unrest at Trident
+
+# Anchored baseline: history before a chosen reference date t0
+anchored_ref_date     <- as.Date("2022-08-24")  # t0; can be any date of interest
+anchored_span_years   <- 5                      # 3, 5, or 7 years
+anchored_historical   <- FALSE                  # TRUE = full history up to t0 (ignore span)
+```
+
+# Rolling baseline function (for optional rolling mode)
+
+Description: For rolling mode, compute per-date baseline statistics using the previous N years of daily seismic metrics (excluding the current day).
+```{r compute-rolling-baseline}
+compute_rolling_baseline <- function(quakes_daily,
+                                     window_years = 3,
+                                     min_days = 30) {
+  dates <- quakes_daily$date
+  
+  purrr::map_dfr(dates, function(d) {
+    start <- d %m-% years(window_years)  # window_years before date d
+    ref <- quakes_daily %>%
+      filter(date >= start, date < d)    # strictly before current day
+    
+    if (nrow(ref) < min_days) {
+      tibble(
+        date   = d,
+        n_mu   = NA_real_,
+        n_sd   = NA_real_,
+        p90_mu = NA_real_,
+        p90_sd = NA_real_,
+        shp_mu = NA_real_,
+        shp_sd = NA_real_
+      )
+    } else {
+      tibble(
+        date   = d,
+        n_mu   = mean(ref$n_events,    na.rm = TRUE),
+        n_sd   = sd(ref$n_events,      na.rm = TRUE),
+        p90_mu = mean(ref$p90_mag,     na.rm = TRUE),
+        p90_sd = sd(ref$p90_mag,       na.rm = TRUE),
+        shp_mu = mean(ref$shallow_pct, na.rm = TRUE),
+        shp_sd = sd(ref$shallow_pct,   na.rm = TRUE)
+      )
+    }
+  })
+}
+```
+
+# Compute unrest score using selected baseline mode
+
+Description:
+	•	Standardize each daily metric relative to its baseline (fixed, rolling, or anchored) using z-scores.
+	•	Convert z-scores to intensities (0–1), average them, and rescale to 0–100.
+	•	Assign a traffic-light status (Green/Yellow/Orange/Red) based on the unrest score.
+```{r compute-unrest-score}
+intensity_from_z <- function(z) {
+  x <- z / 3           # 3 sd ~= "max" intensity
+  x <- pmin(pmax(x, 0), 1)
+  return(x)
+}
+
+eps <- 1e-6  # to avoid divide-by-zero
+
+if (baseline_mode == "fixed") {
+  # ----------------------------------------------
+  # Fixed baseline: single historical quiet period
+  # ----------------------------------------------
+  baseline_stats <- quakes_daily %>%
+    filter(date >= baseline_fixed_start,
+           date <  baseline_fixed_end) %>%
+    summarise(
+      n_mu    = mean(n_events,    na.rm = TRUE),
+      n_sd    = sd(n_events,      na.rm = TRUE),
+      p90_mu  = mean(p90_mag,     na.rm = TRUE),
+      p90_sd  = sd(p90_mag,       na.rm = TRUE),
+      shp_mu  = mean(shallow_pct, na.rm = TRUE),
+      shp_sd  = sd(shallow_pct,   na.rm = TRUE)
+    )
+  
+  quakes_scored <- quakes_daily %>%
+    mutate(
+      z_n   = (n_events    - baseline_stats$n_mu)   / (baseline_stats$n_sd   + eps),
+      z_p90 = (p90_mag     - baseline_stats$p90_mu) / (baseline_stats$p90_sd + eps),
+      z_shp = (shallow_pct - baseline_stats$shp_mu) / (baseline_stats$shp_sd + eps),
+      
+      I_n   = intensity_from_z(z_n),
+      I_p90 = intensity_from_z(z_p90),
+      I_shp = intensity_from_z(z_shp),
+      
+      unrest_score = 100 * (I_n + I_p90 + I_shp) / 3,
+      status = case_when(
+        unrest_score < 20 ~ "Green",
+        unrest_score < 40 ~ "Yellow",
+        unrest_score < 70 ~ "Orange",
+        TRUE              ~ "Red"
+      )
+    )
+  
+} else if (baseline_mode == "rolling") {
+  # ----------------------------------------------
+  # Rolling baseline: previous N years per date
+  # ----------------------------------------------
+  baseline_rolling <- compute_rolling_baseline(
+    quakes_daily,
+    window_years = baseline_window_years
+  )
+  
+  quakes_scored <- quakes_daily %>%
+    left_join(baseline_rolling, by = "date") %>%
+    mutate(
+      z_n   = (n_events    - n_mu)   / (n_sd   + eps),
+      z_p90 = (p90_mag     - p90_mu) / (p90_sd + eps),
+      z_shp = (shallow_pct - shp_mu) / (shp_sd + eps),
+      
+      I_n   = intensity_from_z(z_n),
+      I_p90 = intensity_from_z(z_p90),
+      I_shp = intensity_from_z(z_shp),
+      
+      unrest_score = 100 * (I_n + I_p90 + I_shp) / 3,
+      status = case_when(
+        unrest_score < 20 ~ "Green",
+        unrest_score < 40 ~ "Yellow",
+        unrest_score < 70 ~ "Orange",
+        TRUE              ~ "Red"
+      )
+    )
+  
+} else if (baseline_mode == "anchored") {
+  # ----------------------------------------------
+  # Anchored baseline: history before a reference date t0
+  # ----------------------------------------------
+  # Determine baseline window relative to anchored_ref_date
+  if (anchored_historical) {
+    baseline_start <- min(quakes_daily$date, na.rm = TRUE)
+  } else {
+    baseline_start <- anchored_ref_date %m-% years(anchored_span_years)
+  }
+  baseline_end <- anchored_ref_date
+  
+  baseline_stats <- quakes_daily %>%
+    filter(date >= baseline_start,
+           date <  baseline_end) %>%
+    summarise(
+      n_mu    = mean(n_events,    na.rm = TRUE),
+      n_sd    = sd(n_events,      na.rm = TRUE),
+      p90_mu  = mean(p90_mag,     na.rm = TRUE),
+      p90_sd  = sd(p90_mag,       na.rm = TRUE),
+      shp_mu  = mean(shallow_pct, na.rm = TRUE),
+      shp_sd  = sd(shallow_pct,   na.rm = TRUE)
+    )
+  
+  quakes_scored <- quakes_daily %>%
+    mutate(
+      z_n   = (n_events    - baseline_stats$n_mu)   / (baseline_stats$n_sd   + eps),
+      z_p90 = (p90_mag     - baseline_stats$p90_mu) / (baseline_stats$p90_sd + eps),
+      z_shp = (shallow_pct - baseline_stats$shp_mu) / (baseline_stats$shp_sd + eps),
+      
+      I_n   = intensity_from_z(z_n),
+      I_p90 = intensity_from_z(z_p90),
+      I_shp = intensity_from_z(z_shp),
+      
+      unrest_score = 100 * (I_n + I_p90 + I_shp) / 3,
+      status = case_when(
+        unrest_score < 20 ~ "Green",
+        unrest_score < 40 ~ "Yellow",
+        unrest_score < 70 ~ "Orange",
+        TRUE              ~ "Red"
+      )
+    )
+}
+```
+
+# Smooth unrest score with a 7-day moving average
+
+Description: To reduce noise from day-to-day fluctuations in seismicity, a 7-day rolling mean is applied to the unrest index. This smoothing highlights broader trends in volcanic activity, making the seismic state easier to interpret in dashboards and public-facing visualizations. The raw daily score is preserved for internal analysis, while the averaged score (unrest_score_7d) is used for plotting.
+```{r seven-day-rolling-mean}
+quakes_scored <- quakes_scored %>%
+  arrange(date) %>%
+  mutate(
+    unrest_score_7d = as.numeric(zoo::rollapply(
+      unrest_score,
+      width = 7,
+      FUN = mean,
+      align = "right",
+      fill = NA,
+      na.rm = TRUE
+    ))
+  )
+
+summary(quakes_scored$unrest_score_7d)
+```
+
+# Baseline mean for plotting (anchored to t₀)
+
+Description: Compute the mean of the 7-day smoothed unrest score over the chosen baseline window (3/5/7 years or historical before the reference date). This will be shown as a dashed horizontal line on the plot.
+```{r baseline-mean-for-plot}
+if (baseline_mode == "fixed") {
+  baseline_start_plot <- baseline_fixed_start
+  baseline_end_plot   <- baseline_fixed_end
+  
+} else if (baseline_mode == "anchored") {
+  if (anchored_historical) {
+    baseline_start_plot <- min(quakes_scored$date, na.rm = TRUE)
+  } else {
+    baseline_start_plot <- anchored_ref_date %m-% years(anchored_span_years)
+  }
+  baseline_end_plot <- anchored_ref_date
+  
+} else {
+  baseline_start_plot <- NA
+  baseline_end_plot   <- NA
+}
+
+if (!is.na(baseline_start_plot)) {
+  baseline_mean_score <- quakes_scored %>%
+    filter(date >= baseline_start_plot,
+           date <  baseline_end_plot) %>%
+    summarise(mu = mean(unrest_score_7d, na.rm = TRUE)) %>%
+    pull(mu)
+} else {
+  baseline_mean_score <- NA_real_
+}
+
+baseline_start_plot
+baseline_end_plot
+baseline_mean_score
+```
+
+# Plot the Trident Seismic Unrest Score
+
+Description: Visualize the 7-day smoothed unrest score over time with color-coded status, a vertical line marking the anchored reference date, and a dashed horizontal line showing the baseline mean over the chosen window.
+```{r plot-unrest-score}
+subtitle_text <- dplyr::case_when(
+  baseline_mode == "fixed" ~ paste0(
+    "Fixed baseline: ", baseline_fixed_start, " to ", baseline_fixed_end, " (pre-unrest)"
+  ),
+  baseline_mode == "rolling" ~ paste0(
+    "Rolling baseline: previous ", baseline_window_years, " years per day"
+  ),
+  baseline_mode == "anchored" & anchored_historical ~ paste0(
+    "Anchored historical baseline up to ", anchored_ref_date
+  ),
+  baseline_mode == "anchored" ~ paste0(
+    "Anchored baseline: ", anchored_span_years, "-year window before ", anchored_ref_date
+  ),
+  TRUE ~ ""
+)
+
+# Vertical line date: baseline_fixed_end for fixed, anchored_ref_date for anchored
+vline_date <- if (baseline_mode == "fixed") {
+  baseline_fixed_end
+} else if (baseline_mode == "anchored") {
+  anchored_ref_date
+} else {
+  NA
+}
+
+p <- ggplot(
+  quakes_scored,
+  aes(
+    x = date,
+    y = unrest_score_7d,
+    color = status,
+    text = paste0(
+      "Date: ", date,
+      "<br>Score (7d): ", round(unrest_score_7d, 1),
+      "<br>Daily events: ", n_events,
+      "<br>p90 mag: ", round(p90_mag, 2),
+      "<br>Shallow %: ", round(shallow_pct * 100, 1), "%"
+    )
+  )
+) +
+  geom_line(na.rm = TRUE) +
+  geom_vline(
+    xintercept = as.numeric(vline_date),
+    linetype   = "dashed"
+  ) +
+  {
+    if (!is.na(baseline_mean_score)) {
+      geom_hline(yintercept = baseline_mean_score,
+                 linetype = "dashed")
+    } else {
+      NULL
+    }
+  } +
+# Baseline label annotation (rounded to 2 decimal places, placed above the line)
+{
+  if (!is.na(baseline_mean_score)) {
+    annotate(
+      "text",
+      x = max(quakes_scored$date, na.rm = TRUE),
+      y = baseline_mean_score + 2,  # 2 units above the line on the 0–100 scale
+      label = paste0("Baseline \u2248 ", round(baseline_mean_score, 2)),
+      hjust = -0.1,
+      vjust = 0.5,
+      size = 3.5,
+      color = "black"
+    )
+  } else {
+    NULL
+  }
+} +
+  labs(
+    title = "Trident Volcano – 7-Day Seismic Unrest Score",
+    subtitle = subtitle_text,
+    x = "Date",
+    y = "Unrest Score (0–100, 7-day mean)",
+    color = "Status"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Green"  = "#00CC00",
+      "Yellow" = "#FFD700",
+      "Orange" = "#FF9900",
+      "Red"    = "#CC0000"
+    ),
+    breaks = c("Red", "Orange", "Yellow", "Green")
+  ) +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "#F0F0F0", color = NA),
+    plot.background  = element_rect(fill = "#F0F0F0", color = NA),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    clip = "off"
+  )
+```
+
+# Interactive hover-enabled unrest visualization
+
+Description: The final plot is rendered as an interactive HTML widget using plotly::ggplotly(). Hovering over the line (and points) reveals detailed values for each date, including the 7-day unrest score, daily earthquake count, magnitude distribution, and shallow earthquake percentage.
+```{r interactive-plot}
+# Add points to make individual days easy to see in the interactive view
+p <- p + geom_point(size = 0.5, alpha = 0.9)
+
+ggplotly(p, tooltip = "text")
+```
+
+```{r}
+
+```
+
+🔧 1) Extract Functions into a Separate R Script
+
+Goal: Move “engine” logic out of the Rmd and into a reusable script.
+	•	Create something like R/asui_functions.R.
+	•	Move helpers there (e.g. intensity_from_z(), compute_rolling_baseline(), baseline logic, future compute_asui()).
+	•	In the Rmd, just source("R/asui_functions.R") at the top.
+	•	This is step one toward an R package / dashboard backend.
+
+⸻
+
+📄 2) Simplify & Reorganize the R Markdown File
+
+Goal: Make the Rmd readable to any new person opening the project.
+	•	Reorganize sections into: Intro / Data Download / Daily Metrics / Baseline / Scoring / Visualization.
+	•	Keep only “glue” code in the Rmd; call functions from your script for main steps.
+	•	Add short prose before each chunk explaining what and why (you’re already doing this—just tighten it up now that functions exist).
+
+⸻
+
+📊 3) Finalize Baseline Behavior & Display
+
+Goal: Be crystal-clear about what “baseline” means and how it’s shown.
+	•	Confirm you’re happy with the anchored baseline logic:
+3/5/7-year or historical window before a chosen reference date t₀.
+	•	Decide that the baseline mean line uses 7-day smoothed scores (current approach) or raw daily scores, and keep it consistent in the code and text.
+	•	Double-check baseline_mean_score and its date range filters.
+
+⸻
+
+📈 4) Compute 7-Day Metrics for Tooltip Consistency
+
+Goal: Make everything shown in the interactive tooltip match the 7-day window.
+	•	Add 7-day versions for:
+	•	n_events_7d_avg (avg quakes/day over last 7 days)
+	•	p90_mag_7d (maybe 90th percentile over a 7-day window)
+	•	shallow_pct_7d (avg shallow % over last 7 days)
+	•	Store them in quakes_scored alongside unrest_score_7d.
+
+⸻
+
+🪧 5) Redesign Tooltip Text
+
+Goal: Make hover text unambiguous and aligned with the smoothing window.
+	•	Update text = paste0(...) to use the new 7-day metrics.
+	•	Label clearly, e.g.:
+	•	Avg quakes/day (7-day mean):
+	•	90th percentile mag (7-day window):
+	•	Shallow % (7-day window):
+	•	Decide whether to show a date range (t-6 to t) or just the end date; whichever you pick, explain it in the tooltip text or a note.
+
+⸻
+
+🎨 6) Improve Status Legend (Labels + Circles)
+
+Goal: Make the legend self-explanatory and visually intuitive.
+	•	Update scale_color_manual(..., labels = ...) so each color has a meaning, e.g.:
+	•	Green – Background
+	•	Yellow – Mild unrest
+	•	Orange – Elevated unrest
+	•	Red – Strong unrest
+	•	Use guides(color = guide_legend(override.aes = list(linetype = 0, shape = 16, size = 4))) to show colored circles instead of lines.
+
+⸻
+
+📏 7) Finalize Baseline Line & Label Formatting
+
+Goal: Ensure the baseline line + “Baseline ≈ X.XX” label are readable.
+	•	Confirm the dashed horizontal line and vertical reference line behave correctly for different baselines.
+	•	Make sure the text annotation:
+	•	Uses round(baseline_mean_score, 2)
+	•	Sits above the line (adjust + 2 or similar)
+	•	Is fully visible (tune hjust, vjust, and clip = "off" in theme() if needed).
+
+⸻
+
+🎛 8) Sketch Dashboard Parameters (for Future Shiny/App)
+
+Goal: Lock in how the eventual dashboard will control your engine.
+	•	Decide on user controls:
+	•	Volcano name / coordinate box
+	•	Reference date t₀
+	•	Baseline window (3, 5, 7, historical)
+	•	Write a short “Design Notes” section (in Rmd or a separate .md) explaining how these map to function arguments (e.g., ref_date, anchored_span_years, anchored_historical).
+
+⸻
+
+🐙 9) Create a GitHub Project and README
+
+Goal: Turn this into a shareable, documented mini-project.
+	•	Create a new GitHub repo (e.g., trident-asui or volcano-unrest-index).
+	•	Add:
+	•	Trident_Volcano.Rmd
+	•	R/asui_functions.R
+	•	(Optionally) a data/ or outputs/ folder if you cache anything.
+	•	Write a README that includes:
+	•	Overview: One-paragraph description of the project and the idea of a Seismic Unrest Index.
+	•	Data Source: USGS FDSN API + Trident bounding box.
+	•	Methods Summary: Brief description of daily metrics, baseline options (anchored 3/5/7/historical), and 7-day smoothing.
+	•	How to Run: R version, required packages, and how to knit the Rmd.
+	•	Future Work: Note that this is a prototype for a multi-volcano dashboard / potential R package.
+	
+10) 🔎 Volcano-Specific Boundary Detection (Seismic Clustering)
+• Replace manual bounding boxes (latitude/longitude rectangles) with data-driven clustering.
+• Goal: Identify seismic swarms that belong to a volcano vs. surrounding tectonic quakes.
+• Method (recommended): DBSCAN or OPTICS in 3D (latitude, longitude, depth).
+• Output: An automatically inferred “volcano region” instead of user-chosen coordinates.
+
+11) 🤖 Predictive / Forecasting Enhancement
+• Add a forecasting model that estimates near-future unrest score trends.
+• Potential methods (starting simple → more advanced):
+◇ ARIMA or Exponential Smoothing on unrest scores
+◇ Random Forest Regression trained on seismic features
+◇ Neural sequence models (LSTM) once enough data is available
+• Output: A trend arrow & confidence band on the dashboard (e.g., “increasing unrest”).
+
+🧬 12) AI Scientific Interpretation Layer
+
+Goal: Automatically generate human-readable, scientifically grounded summaries of volcanic activity based on the dashboard state (chosen volcano, time range, baseline settings, clustering, etc.).
+
+What it produces:
+	•	A clear 1–2 paragraph written interpretation such as:
+“Between March 14–21, Trident Volcano experienced elevated seismicity with a 7-day unrest score of 46.2 (Orange status)…”
+	•	Explanation of what metrics drove the score
+“The unrest was primarily driven by a spike in shallow earthquakes (78% < 5 km)…”
+	•	Explanation of how boundaries or clusters were chosen
+“Earthquake locations formed a DBSCAN cluster centered beneath the summit fissure…”
+	•	Context + next-step phrase (non-predictive or predictive, depending on model availability)
+“If current trends continue, unrest may remain elevated over the next week.”
+
+Key Feature Requirements:
+	•	Must use only analyzed data, no hallucinations
+	•	Optional use of a trained local model OR an online LLM (configurable)
+	•	Uses a “scientific tone with uncertainty language,” e.g.
+	•	“suggests,” “consistent with,” “may indicate,” “cannot rule out,” “no evidence of…”
+
+Inputs to the AI:
+	•	Current volcano, bounding shape or cluster
+	•	Baseline mode and window (3/5/7/10/historical)
+	•	7-day unrest score
+	•	Feature drivers: event count, 90th percentile magnitude, shallow % change
+	•	Optional predictions (if Bullet 11 is enabled)
+
+Outputs for user:
+	•	Downloadable or copyable report snippet (Markdown, CSV metadata, or PDF summary)
+	•	Optional voice narration (later extension)
+	
+🧠 Bonus Future Stretch
+	•	Let users click any date or week and generate a one-off “Seismic Snapshot Report”
+	•	Generate comparison reports between two unrest periods
+	•	Provide educational tooltips that explain geophysics concepts (butonly when asked)
+	
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
