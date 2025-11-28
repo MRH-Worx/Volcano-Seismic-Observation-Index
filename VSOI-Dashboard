@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volcano Seismic Observation Index (VSOI) Dashboard</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Inter font -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&display=swap">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7fafc; /* Light gray background */
+        }
+        .unrest-red { --tw-bg-opacity: 1; background-color: #ef4444; } /* Red-500 */
+        .unrest-orange { --tw-bg-opacity: 1; background-color: #f97316; } /* Orange-500 */
+        .unrest-yellow { --tw-bg-opacity: 1; background-color: #fcd34d; } /* Yellow-300 */
+        .unrest-green { --tw-bg-opacity: 1; background-color: #22c55e; } /* Green-500 */
+        .status-badge {
+            padding: 0.5rem 1.5rem;
+            font-weight: 700;
+            color: #1f2937; /* Dark text for contrast */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Custom scrollbar for data tables */
+        .data-table-container::-webkit-scrollbar {
+            height: 8px;
+        }
+        .data-table-container::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+
+    <div id="app" class="max-w-7xl mx-auto space-y-8">
+        <!-- Header -->
+        <header class="text-center py-6 bg-white rounded-xl shadow-lg">
+            <h1 class="text-4xl font-extrabold text-gray-900 flex items-center justify-center">
+                <span class="mr-3">🌋</span>
+                Volcano Seismic Observation Index (VSOI)
+            </h1>
+            <p class="mt-2 text-xl text-gray-600">Trident Volcano v3: Daily Seismic Unrest Monitoring</p>
+        </header>
+
+        <!-- Main Status Card -->
+        <section id="current-status" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- Card 1: Current Unrest Score -->
+            <div class="lg:col-span-2 bg-white p-6 rounded-xl shadow-lg flex flex-col sm:flex-row items-center justify-between">
+                <div class="text-center sm:text-left">
+                    <p class="text-2xl font-semibold text-gray-500">7-Day Smoothed Unrest Score</p>
+                    <!-- Simulated Live Data (Based on README example: 71.3 - Red) -->
+                    <p id="current-score" class="text-7xl font-bold mt-2 transition-colors duration-500 text-red-600">
+                        71.3
+                    </p>
+                    <p class="text-lg text-gray-500 mt-1">As of: 2025-11-27</p>
+                </div>
+                <div class="mt-6 sm:mt-0 sm:ml-6 flex-shrink-0">
+                    <div id="status-badge" class="status-badge unrest-red rounded-full">
+                        RED ALERT
+                    </div>
+                </div>
+            </div>
+
+            <!-- Card 2: Key Metrics Summary -->
+            <div class="bg-white p-6 rounded-xl shadow-lg space-y-4">
+                <h3 class="text-xl font-semibold text-gray-800 border-b pb-2">Key Metrics (Last 7 Days)</h3>
+                <div class="flex justify-between">
+                    <span class="text-gray-600">Total Earthquake Count:</span>
+                    <span class="font-medium text-gray-800">450</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-600">90th Percentile Magnitude:</span>
+                    <span class="font-medium text-gray-800">M 2.4</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-600">Shallow Events (< 5km):</span>
+                    <span class="font-medium text-gray-800">42%</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Visualization Section -->
+        <section id="visualization" class="bg-white p-6 rounded-xl shadow-lg">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Interactive Unrest Visualization</h2>
+            
+            <!-- Plotly Placeholder - A real application would inject the interactive Plotly HTML/JS here -->
+            <div id="plotly-chart-placeholder" class="min-h-96 w-full flex items-center justify-center bg-gray-50 border-2 border-gray-200 border-dashed rounded-lg p-8">
+                <p class="text-gray-500 text-lg">
+                    [Interactive Plotly Chart Placeholder]<br>
+                    This area would display the `plotly::ggplotly()` output, showing:<br>
+                    <span class="font-medium">Unrest Score Trend, Daily Count, Magnitude, and Depth % on hover.</span>
+                </p>
+            </div>
+            
+            <p class="mt-4 text-sm text-gray-500">
+                Visualization Period: 2010-01-01 to Present. The line color changes based on the calculated VSOI Status.
+            </p>
+        </section>
+
+        <!-- Data Integrity & Recent Events -->
+        <section id="details" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            
+            <!-- Data Integrity Checks -->
+            <div class="bg-white p-6 rounded-xl shadow-lg">
+                <h3 class="text-xl font-semibold text-gray-800 border-b pb-2 flex items-center">
+                    <span class="mr-2 text-blue-500">🧪</span> Data Integrity Checks
+                </h3>
+                <ul class="mt-4 space-y-2 text-gray-700">
+                    <li class="flex items-center">
+                        <span class="text-green-500 mr-2">✔</span> Raw event count = sum of daily counts
+                    </li>
+                    <li class="flex items-center">
+                        <span class="text-green-500 mr-2">✔</span> Shallow % must fall between 0 and 1
+                    </li>
+                    <li class="flex items-center">
+                        <span class="text-yellow-500 mr-2">⚠️</span> All events within selected volcano boundary
+                    </li>
+                </ul>
+                <p class="mt-4 text-sm text-gray-500">
+                    *(Checks run silently to safeguard analysis results. Yellow indicates boundary clustering mode might be enabled.)*
+                </p>
+            </div>
+
+            <!-- Recent Unrest History Table -->
+            <div class="bg-white p-6 rounded-xl shadow-lg">
+                <h3 class="text-xl font-semibold text-gray-800 border-b pb-2 flex items-center">
+                    <span class="mr-2 text-red-500">🚨</span> Recent Unrest History
+                </h3>
+                <!-- Data Table Container with Horizontal Scroll on Small Screens -->
+                <div class="mt-4 overflow-x-auto data-table-container">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
+                                <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            <!-- Data from README.md example -->
+                            <tr class="hover:bg-gray-50 transition duration-150">
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">2023-01-20</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">71.3</td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="status-badge unrest-red rounded-lg text-xs">🔴 Red</span>
+                                </td>
+                            </tr>
+                            <tr class="hover:bg-gray-50 transition duration-150">
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">2022-10-01</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">46.7</td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="status-badge unrest-orange rounded-lg text-xs">🟠 Orange</span>
+                                </td>
+                            </tr>
+                            <tr class="hover:bg-gray-50 transition duration-150">
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">2021-06-12</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">4.2</td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="status-badge unrest-green rounded-lg text-xs">🟢 Green</span>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Footer / Project Info -->
+        <footer class="text-center py-4 text-gray-500 text-sm border-t mt-8">
+            <p>Volcano Seismic Observation Index (VSOI) - Open Science Project.</p>
+            <p>Based on open-source data from the USGS FDSN API.</p>
+        </footer>
+
+    </div>
+
+</body>
+</html>
